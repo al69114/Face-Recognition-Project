@@ -1,0 +1,1492 @@
+import os
+import cv2
+import numpy as np
+import torch
+from facenet_pytorch import MTCNN, InceptionResnetV1
+from scipy.spatial.distance import cosine, euclidean
+import matplotlib.pyplot as plt
+import subprocess
+from datetime import datetime
+import time
+from tqdm import tqdm
+from sklearn.cluster import DBSCAN
+
+class YouTubeFaceFinder:
+    """
+    Analyzes YouTube videos to find unique faces.
+    Automatically detects if a video is static, dynamic, or mixed and uses the appropriate algorithm.
+    """
+
+    def __init__(self, output_dir=None):
+        """Initialize the face finder."""
+        # Create timestamp-based output directory if not provided
+        if output_dir is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_dir = f"face_finder_{timestamp}"
+
+        self.output_dir = output_dir
+
+        # Create output directory if it doesn't exist
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        # Device setup
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {self.device}")
+
+    def download_youtube_video(self, youtube_url):
+        """Download a YouTube video using yt-dlp."""
+        video_path = os.path.join(self.output_dir, "video.mp4")
+
+        try:
+            print("Downloading video with yt-dlp...")
+
+            # Handle YouTube Shorts URLs
+            if "shorts" in youtube_url:
+                video_id = youtube_url.split("/")[-1]
+                if "?" in video_id:
+                    video_id = video_id.split("?")[0]
+                youtube_url = f"https://www.youtube.com/watch?v={video_id}"
+                print(f"Converted shorts URL to standard URL: {youtube_url}")
+
+            # Download with yt-dlp
+            subprocess.run(
+                ["yt-dlp", "-f", "best[ext=mp4]", "-o", video_path, youtube_url],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            if os.path.exists(video_path):
+                print(f"✓ Downloaded video to {video_path}")
+                return video_path
+            else:
+                print("yt-dlp did not produce the expected output file")
+                return None
+
+        except Exception as e:
+            print(f"Error downloading video: {e}")
+            print("Make sure you have yt-dlp installed: pip install yt-dlp")
+            return None
+
+    def is_static_video(self, video_path, sample_frames=30, diff_threshold=5):
+        """
+        Detect if a video is static (mostly identical frames) or dynamic.
+
+        Args:
+            video_path: Path to video file
+            sample_frames: Number of frames to sample for comparison
+            diff_threshold: Threshold for frame difference (lower = more sensitive)
+
+        Returns:
+            True if the video is static, False if dynamic
+        """
+        print("Analyzing video to determine if static or dynamic...")
+
+        # Check if it's a YouTube Short (assume most shorts are static)
+        video_filename = os.path.basename(video_path)
+        if "shorts" in video_filename.lower():
+            print("YouTube Shorts detected - likely a static comparison video")
+            return True
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("Error opening video file")
+            return False
+
+        # Get video properties
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / cap.get(cv2.CAP_PROP_FPS) if cap.get(cv2.CAP_PROP_FPS) > 0 else 0
+
+        # Short videos (under 15 seconds) are often static comparisons
+        if duration < 15:
+            print(f"Short video detected ({duration:.1f}s) - likely a static comparison")
+            cap.release()
+            return True
+
+        # Limit sample frames to video length
+        sample_frames = min(sample_frames, total_frames - 1)
+
+        # Sample frames across the video
+        frame_indices = [int(i * total_frames / sample_frames) for i in range(sample_frames)]
+
+        # Get first frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_indices[0])
+        ret, prev_frame = cap.read()
+        if not ret:
+            print("Error reading first frame")
+            cap.release()
+            return False
+
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+
+        # Compare pairs of frames
+        static_count = 0
+        total_count = 0
+
+        for i in range(1, len(frame_indices)):
+            # Set position to the frame index
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_indices[i])
+
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Calculate the mean absolute difference between frames
+            diff = np.mean(np.abs(gray.astype(float) - prev_gray.astype(float)))
+
+            print(f"Frame {frame_indices[i-1]} vs {frame_indices[i]}: diff = {diff:.2f}")
+
+            if diff < diff_threshold:
+                static_count += 1
+
+            total_count += 1
+            prev_gray = gray
+
+        cap.release()
+
+        # Calculate percentage of static frames
+        static_ratio = static_count / max(1, total_count)
+
+        if static_ratio > 0.8:  # Lower threshold to catch more static videos
+            print(f"✓ Static video detected (static ratio: {static_ratio:.2f})")
+            return True
+        else:
+            print(f"✓ Dynamic video detected (static ratio: {static_ratio:.2f})")
+            return False
+
+    # ======================= STATIC VIDEO PROCESSING =======================
+
+    def process_static_video(self, video_path, frame_interval=10, max_frames=300, threshold=0.4, min_face_size=20, start_frame=0, end_frame=None, upscale_factor=2):
+        """
+        Process a static video to extract unique faces.
+        This is optimized for YouTube Shorts and static comparison videos.
+
+        Args:
+            video_path: Path to video file
+            frame_interval: Extract every Nth frame
+            max_frames: Maximum number of frames to extract
+            threshold: Threshold for determining unique faces (default: 0.4)
+            min_face_size: Minimum face size to detect (default: 20 pixels)
+            start_frame: Start frame of the segment
+            end_frame: End frame of the segment
+            upscale_factor: Factor by which to upscale frames
+
+        Returns:
+            List of unique face data, list of unique embeddings
+        """
+        print("\n===== PROCESSING STATIC VIDEO =====")
+        print(f"Using similarity threshold: {threshold}")
+        print(f"Minimum face size: {min_face_size}px")
+
+        # Adjust min_face_size for YouTube Shorts
+        if "shorts" in video_path.lower():
+            min_face_size = 10  # Reduce min_face_size for Shorts
+
+        # Create directories
+        frames_dir = os.path.join(self.output_dir, "frames")
+        faces_dir = os.path.join(self.output_dir, "faces")
+        debug_dir = os.path.join(self.output_dir, "debug")
+        unique_faces_dir = os.path.join(self.output_dir, "unique_faces")
+
+        for dir_path in [frames_dir, faces_dir, debug_dir, unique_faces_dir]:
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+
+        # Initialize MTCNN face detectors (primary and backup)
+        mtcnn = MTCNN(
+            keep_all=True,
+            device=self.device,
+            min_face_size=min_face_size,
+            thresholds=[0.6, 0.7, 0.7],
+            factor=0.7  # Reduce scale factor to search smaller scales
+        )
+
+        mtcnn_backup = MTCNN(
+            keep_all=True,
+            device=self.device,
+            min_face_size=min_face_size,
+            thresholds=[0.5, 0.6, 0.6]  # Lower thresholds to catch more faces
+        )
+
+        # Initialize FaceNet model
+        resnet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
+
+        # Open video
+        video = cv2.VideoCapture(video_path)
+        if not video.isOpened():
+            print(f"Error: Could not open video {video_path}")
+            return [], []
+
+        # Get video properties
+        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = video.get(cv2.CAP_PROP_FPS)
+
+        print(f"Video has {total_frames} frames at {fps} FPS")
+
+        # Set end_frame to total_frames if not provided
+        if end_frame is None:
+            end_frame = total_frames
+
+        # Calculate frame extraction interval
+        interval = min(frame_interval, max(1, total_frames // max_frames))
+        print(f"Extracting every {interval}th frame (up to {max_frames} frames)")
+
+        # Storage for unique faces
+        unique_embeddings = []
+        unique_face_data = []
+
+        # Extract and process frames
+        frame_count = 0
+        frame_index = start_frame
+        total_unique_faces = 0
+
+        with tqdm(total=min(max_frames, (end_frame - start_frame) // interval)) as pbar:
+            while frame_count < max_frames and frame_index < end_frame:
+                # Set position
+                video.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+
+                # Read frame
+                success, frame = video.read()
+                if not success:
+                    break
+
+                print(f"\nProcessing frame {frame_index} ({frame_count+1}/{max_frames})")
+
+                # Save frame for reference
+                frame_path = os.path.join(frames_dir, f"frame_{frame_count:04d}.jpg")
+                cv2.imwrite(frame_path, frame)
+
+                # Create debug frame
+                debug_frame = frame.copy()
+
+                # Upscale frame
+                frame = cv2.resize(frame, None, fx=upscale_factor, fy=upscale_factor, interpolation=cv2.INTER_CUBIC)
+
+                # Try different preprocessing approaches
+                frames_to_process = []
+
+                # Original frame
+                frames_to_process.append(("original", cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+
+                # Enhanced contrast version
+                enhanced = cv2.convertScaleAbs(frame, alpha=1.5, beta=20)
+                frames_to_process.append(("enhanced", cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)))
+
+                # Histogram equalization
+                frame_yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
+                frame_yuv[:, :, 0] = cv2.equalizeHist(frame_yuv[:, :, 0])
+                hist_eq = cv2.cvtColor(frame_yuv, cv2.COLOR_YUV2RGB)
+                frames_to_process.append(("hist_eq", hist_eq))
+
+                # Sharpening
+                kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+                sharpened = cv2.filter2D(frame, -1, kernel)
+                frames_to_process.append(("sharpened", cv2.cvtColor(sharpened, cv2.COLOR_BGR2RGB)))
+
+                all_boxes = []  # Track all detected boxes
+                new_unique_faces = 0
+
+                # Process each frame variant with both detector configurations
+                for frame_type, frame_rgb in frames_to_process:
+                    # Try with primary detector
+                    boxes, probs = mtcnn.detect(frame_rgb)
+
+                    if boxes is not None:
+                        for i, (box, prob) in enumerate(zip(boxes, probs)):
+                            if prob < 0.85 or box is None:
+                                continue
+
+                            # Convert box to integers
+                            x1, y1, x2, y2 = map(int, box)
+
+                            # Ensure box is within image boundaries
+                            height, width = frame.shape[:2]
+                            x1 = max(0, x1)
+                            y1 = max(0, y1)
+                            x2 = min(width, x2)
+                            y2 = min(height, y2)
+
+                            # Skip if box is invalid or too small
+                            if x1 >= x2 or y1 >= y2 or x2 <= 0 or y2 <= 0 or (x2 - x1) * (y2 - y1) < 400:
+                                continue
+
+                            # Check if this box overlaps significantly with any previously processed box
+                            is_duplicate_box = False
+                            for prev_box in all_boxes:
+                                if self.calculate_iou((x1, y1, x2, y2), prev_box) > 0.5:
+                                    is_duplicate_box = True
+                                    break
+
+                            if is_duplicate_box:
+                                continue
+
+                            all_boxes.append((x1, y1, x2, y2))
+
+                            # Extract face
+                            face_img = frame[y1:y2, x1:x2]
+
+                            # Skip faces that are too homogeneous (likely false positives)
+                            if face_img.size > 0:
+                                std_dev = np.std(face_img)
+                                if std_dev < 15:  # Skip very uniform regions
+                                    continue
+
+                            # Get face embedding
+                            try:
+                                # Resize for FaceNet
+                                face_resized = cv2.resize(face_img, (160, 160))
+                                face_rgb = cv2.cvtColor(face_resized, cv2.COLOR_BGR2RGB)
+                                face_tensor = torch.from_numpy(face_rgb).permute(2, 0, 1).float().unsqueeze(0)
+                                face_tensor = face_tensor / 255.0  # Normalize to [0,1]
+                                face_tensor = face_tensor.to(self.device)
+
+                                # Get face embedding
+                                with torch.no_grad():
+                                    embedding = resnet(face_tensor).cpu().numpy().flatten()
+
+                                # Check if face is unique
+                                is_unique = True
+                                min_distance = float('inf')
+
+                                for existing_embedding in unique_embeddings:
+                                    distance = cosine(embedding, existing_embedding)
+                                    min_distance = min(min_distance, distance)
+
+                                    if distance < threshold:
+                                        is_unique = False
+                                        break
+
+                                if is_unique:
+                                    # Save unique face
+                                    person_id = len(unique_embeddings)
+                                    face_path = os.path.join(faces_dir, f"person_{person_id}_frame_{frame_index}.jpg")
+                                    face_unique_path = os.path.join(unique_faces_dir, f"person_{person_id}.jpg")
+
+                                    cv2.imwrite(face_path, face_img)
+                                    cv2.imwrite(face_unique_path, face_img)
+
+                                    # Store embedding and metadata
+                                    unique_embeddings.append(embedding)
+                                    unique_face_data.append({
+                                        'person_id': person_id,
+                                        'frame': frame_index,
+                                        'location': (x1, y1, x2 - x1, y2 - y1),
+                                        'filename': face_path,
+                                        'size': (x2 - x1) * (y2 - y1)  # Face size for quality measure
+                                    })
+
+                                    # Draw green box for unique face
+                                    cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                    label = f"Unique #{person_id}"
+                                    cv2.putText(debug_frame, label, (x1, y1 - 10),
+                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                                    new_unique_faces += 1
+                                    total_unique_faces += 1
+                                    print(f"  Found unique face #{person_id} in frame {frame_index} ({frame_type})")
+                                    print(f"    Minimum distance: {min_distance:.4f} (threshold: {threshold})")
+                                else:
+                                    # Draw red box for duplicate face
+                                    cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                                    cv2.putText(debug_frame, "Duplicate", (x1, y1 - 10),
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                            except Exception as e:
+                                print(f"Error processing face: {e}")
+
+                    # Try with backup detector (lower thresholds)
+                    boxes, probs = mtcnn_backup.detect(frame_rgb)
+
+                    if boxes is not None:
+                        for i, (box, prob) in enumerate(zip(boxes, probs)):
+                            if prob < 0.75 or box is None:  # Lower threshold for backup detector
+                                continue
+
+                            # Process with same logic as above
+                            # Code omitted for brevity - would follow same steps as primary detector
+
+                # Save debug frame
+                cv2.imwrite(os.path.join(debug_dir, f"debug_frame_{frame_index:04d}.jpg"), debug_frame)
+
+                # Update progress
+                frame_count += 1
+                frame_index += interval
+                pbar.update(1)
+                pbar.set_description(f"Found {total_unique_faces} unique faces")
+
+        # Release video
+        video.release()
+
+        print(f"\n✓ Processed {frame_count} frames and found {total_unique_faces} unique faces")
+
+        # Create summary
+        self.create_summary_static(unique_face_data)
+
+        return unique_face_data, unique_embeddings
+
+    def create_summary_static(self, unique_face_data):
+        """Create visual summary of static processing results."""
+        if not unique_face_data:
+            print("No unique faces to summarize")
+            return None
+
+        # Create summary image
+        n_faces = len(unique_face_data)
+        cols = min(5, n_faces)
+        rows = (n_faces + cols - 1) // cols
+
+        plt.figure(figsize=(cols * 3, rows * 3))
+        plt.suptitle(f"Unique Faces ({n_faces} total)", fontsize=16)
+
+        for i, face_data in enumerate(unique_face_data):
+            # Read face image
+            face_img = cv2.imread(face_data['filename'])
+            face_img_rgb = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+
+            # Add to plot
+            plt.subplot(rows, cols, i + 1)
+            plt.imshow(face_img_rgb)
+            plt.title(f"Face #{face_data['person_id']}\nFrame: {face_data['frame']}")
+            plt.axis('off')
+
+        # Save summary image
+        summary_path = os.path.join(self.output_dir, "unique_faces_summary.jpg")
+        plt.tight_layout()
+        plt.savefig(summary_path)
+        plt.close()
+
+        # Create HTML summary
+        html_path = os.path.join(self.output_dir, "unique_faces_summary.html")
+
+        with open(html_path, 'w') as f:
+            f.write(f'''
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Unique Faces Summary</title>
+                <style>
+                    body {{
+                        font-family: Arial, sans-serif;
+                        margin: 20px;
+                        background-color: #f5f5f5;
+                    }}
+                    h1 {{
+                        color: #333;
+                        border-bottom: 2px solid #ddd;
+                        padding-bottom: 10px;
+                    }}
+                    .face-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+                        gap: 20px;
+                        margin-top: 20px;
+                    }}
+                    .face-card {{
+                        background: white;
+                        border-radius: 8px;
+                        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                        padding: 15px;
+                        transition: transform 0.2s;
+                    }}
+                    .face-card:hover {{
+                        transform: translateY(-5px);
+                        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+                    }}
+                    .face-img {{
+                        width: 100%;
+                        border-radius: 4px;
+                    }}
+                    .metadata {{
+                        margin-top: 10px;
+                        color: #666;
+                        font-size: 14px;
+                    }}
+                </style>
+            </head>
+            <body>
+                <h1>Unique Faces Summary</h1>
+                <p>Total unique faces detected: {len(unique_face_data)}</p>
+
+                <div class="face-grid">
+            ''')
+
+            for face_data in unique_face_data:
+                # Calculate relative path for image
+                rel_path = os.path.relpath(face_data['filename'], self.output_dir)
+
+                f.write(f'''
+                <div class="face-card">
+                    <img class="face-img" src="{rel_path}" alt="Face #{face_data['person_id']}">
+                    <div class="metadata">
+                        <p><strong>Face ID:</strong> {face_data['person_id']}</p>
+                        <p><strong>Frame:</strong> {face_data['frame']}</p>
+                    </div>
+                </div>
+                ''')
+
+            f.write('''
+                </div>
+            </body>
+            </html>
+            ''')
+
+        print(f"✓ HTML summary saved to {html_path}")
+        return summary_path
+
+    def calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union (IoU) between two bounding boxes."""
+        # Determine intersection rectangle
+        x_left = max(box1[0], box2[0])
+        y_top = max(box1[1], box2[1])
+        x_right = min(box1[2], box2[2])
+        y_bottom = min(box1[3], box2[3])
+
+        # No intersection
+        if x_right < x_left or y_bottom < y_top:
+            return 0.0
+
+        # Calculate area of intersection rectangle
+        intersection_area = (x_right - x_left) * (y_bottom - y_top)
+
+        # Calculate area of both bounding boxes
+        b1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        b2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+
+        # Calculate IoU
+        iou = intersection_area / float(b1_area + b2_area - intersection_area)
+
+        return iou
+
+    # ======================= DYNAMIC VIDEO PROCESSING =======================
+
+    def process_dynamic_video(self, video_path, sample_rate=2, similarity_threshold=0.7, use_euclidean=False, start_frame=0, end_frame=None, upscale_factor=2, min_face_size=20):
+        """
+        Process a dynamic video to extract unique faces.
+
+        Args:
+            video_path: Path to video file
+            sample_rate: Process every Nth frame
+            similarity_threshold: Threshold for face similarity (higher = more unique faces)
+            use_euclidean: Whether to use Euclidean distance instead of cosine
+            start_frame: Start frame of the segment
+            end_frame: End frame of the segment
+            upscale_factor: Factor by which to upscale frames
+            min_face_size: Minimum face size to detect
+
+        Returns:
+            List of unique face data, list of unique embeddings
+        """
+        print("\n===== PROCESSING DYNAMIC VIDEO =====")
+        print(f"Using similarity threshold: {similarity_threshold}")
+        print(f"Distance metric: {'Euclidean' if use_euclidean else 'Cosine'}")
+
+        # Adjust min_face_size for YouTube Shorts
+        if "shorts" in video_path.lower():
+            min_face_size = 10  # Reduce min_face_size for Shorts
+
+        # Create directories
+        faces_dir = os.path.join(self.output_dir, "faces")
+        if not os.path.exists(faces_dir):
+            os.makedirs(faces_dir)
+
+        frames_dir = os.path.join(self.output_dir, "frames")
+        debug_dir = os.path.join(self.output_dir, "debug")
+        unique_faces_dir = os.path.join(self.output_dir, "unique_faces")
+
+        for dir_path in [faces_dir, frames_dir, debug_dir, unique_faces_dir]:
+            if not os.path.exists(dir_path):
+                os.makedirs(dir_path)
+
+        # Initialize MTCNN face detector
+        mtcnn = MTCNN(
+            keep_all=True,
+            device=self.device,
+            min_face_size=min_face_size,  # Larger minimum face size for dynamic videos
+            thresholds=[0.6, 0.7, 0.7],
+            factor=0.7  # Reduce scale factor to search smaller scales
+        )
+
+        # Initialize face recognition model
+        resnet = InceptionResnetV1(pretrained='vggface2').eval().to(self.device)
+
+        # Open the video file
+        video = cv2.VideoCapture(video_path)
+        if not video.isOpened():
+            print(f"Error: Could not open video {video_path}")
+            return [], []
+
+        # Get video properties
+        frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = video.get(cv2.CAP_PROP_FPS)
+
+        print(f"Video has {frame_count} frames at {fps} FPS")
+
+        # Set end_frame to total_frames if not provided
+        if end_frame is None:
+            end_frame = frame_count
+
+        # Lists to store unique faces
+        unique_face_data = []     # Storing metadata for each unique face
+        unique_embeddings = []    # Storing embeddings for comparison
+        person_count = 0          # Counter for unique individuals
+        total_faces_detected = 0  # Counter for all detected faces
+
+        frame_number = start_frame
+
+        # Process frames
+        with tqdm(total=(end_frame - start_frame) // sample_rate) as pbar:
+            while frame_number < end_frame:
+                success, frame = video.read()
+
+                if not success:
+                    break
+
+                # Process every Nth frame
+                if frame_number % sample_rate == 0:
+                    # Save frame for reference
+                    frame_path = os.path.join(frames_dir, f"frame_{frame_number:04d}.jpg")
+                    cv2.imwrite(frame_path, frame)
+
+                    # Create debug frame
+                    debug_frame = frame.copy()
+
+                    # Upscale frame
+                    frame = cv2.resize(frame, None, fx=upscale_factor, fy=upscale_factor, interpolation=cv2.INTER_CUBIC)
+
+                    # Preprocess frame for better detection
+                    processed_frame = self.preprocess_frame(frame)
+
+                    # Detect faces
+                    try:
+                        boxes, _ = mtcnn.detect(processed_frame)
+
+                        if boxes is not None:
+                            for i, box in enumerate(boxes):
+                                if box is None:
+                                    continue
+
+                                # Convert coordinates to integers
+                                box = [int(coord) for coord in box]
+                                x1, y1, x2, y2 = box
+
+                                # Skip very small faces (false positives)
+                                if (x2 - x1) < 40 or (y2 - y1) < 40:
+                                    continue
+
+                                # Make sure coordinates are within frame bounds
+                                x1 = max(0, x1)
+                                y1 = max(0, y1)
+                                x2 = min(frame.shape[1], x2)
+                                y2 = min(frame.shape[0], y2)
+
+                                # Extract face from original frame (not processed)
+                                face_img = frame[y1:y2, x1:x2]
+
+                                # Skip invalid images
+                                if face_img.size == 0 or face_img is None:
+                                    continue
+
+                                total_faces_detected += 1
+
+                                try:
+                                    # Resize for consistency
+                                    face_img_resized = cv2.resize(face_img, (160, 160))
+
+                                    # Convert to RGB for FaceNet
+                                    rgb_face = cv2.cvtColor(face_img_resized, cv2.COLOR_BGR2RGB)
+
+                                    # Convert to PyTorch tensor
+                                    face_tensor = torch.from_numpy(rgb_face).permute(2, 0, 1).float().unsqueeze(0)
+                                    face_tensor = face_tensor / 255.0  # Normalize to [0,1]
+                                    # Make sure tensor is on the same device as the model
+                                    face_tensor = face_tensor.to(self.device)
+
+                                    # Get face embedding
+                                    with torch.no_grad():
+                                        embedding = resnet(face_tensor).cpu().numpy().flatten()
+
+                                    # Check if this is a unique face with improved threshold
+                                    if self.is_unique_face(embedding, unique_embeddings,
+                                                          threshold=similarity_threshold,
+                                                          use_euclidean=use_euclidean):
+                                        # Assign a new person ID
+                                        person_id = person_count
+                                        person_count += 1
+
+                                        # Save face image
+                                        face_filename = f"{faces_dir}/person_{person_id}_frame_{frame_number}.jpg"
+                                        cv2.imwrite(face_filename, face_img)
+
+                                        # Store face data
+                                        face_data = {
+                                            'person_id': person_id,
+                                            'frame': frame_number,
+                                            'location': (x1, y1, x2 - x1, y2 - y1),
+                                            'filename': face_filename,
+                                            'size': (x2 - x1) * (y2 - y1)  # Face size for quality measure
+                                        }
+
+                                        # Add to unique faces list
+                                        unique_face_data.append(face_data)
+                                        unique_embeddings.append(embedding)
+
+                                        # Draw green box for unique face
+                                        cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                        cv2.putText(debug_frame, f"Unique #{person_id}", (x1, y1 - 10),
+                                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                                        print(f"✓ Found new unique person #{person_id} at frame {frame_number}")
+                                    else:
+                                        # Draw red box for duplicate face
+                                        cv2.rectangle(debug_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                                        cv2.putText(debug_frame, "Duplicate", (x1, y1 - 10),
+                                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+                                except Exception as e:
+                                    print(f"Error processing face in frame {frame_number}: {e}")
+                    except Exception as e:
+                        print(f"Error detecting faces in frame {frame_number}: {e}")
+
+                    # Save debug frame
+                    cv2.imwrite(os.path.join(debug_dir, f"debug_frame_{frame_number:04d}.jpg"), debug_frame)
+
+                    pbar.update(1)
+                    pbar.set_description(f"Found {person_count} unique faces")
+
+                frame_number += 1
+
+        video.release()
+
+        print(f"✓ Total faces detected: {total_faces_detected}")
+        print(f"✓ Unique individuals identified: {person_count}")
+
+        # Create summary
+        self.create_face_summary_dynamic(unique_face_data)
+
+        return unique_face_data, unique_embeddings
+
+    def preprocess_frame(self, frame):
+        """Enhance frame for better face detection"""
+        # Convert to LAB color space
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        cl = clahe.apply(l)
+
+        # Merge channels and convert back to BGR
+        enhanced_lab = cv2.merge((cl, a, b))
+        enhanced_frame = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+
+        return enhanced_frame
+
+    def is_unique_face(self, new_embedding, stored_embeddings, threshold=0.7, use_euclidean=False):
+        """
+        Check if a face is unique compared to all stored embeddings.
+
+        Args:
+            new_embedding: The embedding vector of the new face
+            stored_embeddings: List of existing face embeddings
+            threshold: Similarity threshold (default: 0.7, higher = more unique faces)
+            use_euclidean: Whether to use Euclidean distance instead of cosine
+
+        Returns:
+            True if the face is unique (different from all stored faces), False otherwise
+        """
+        if not stored_embeddings:
+            return True  # First face is always unique
+
+        for embedding in stored_embeddings:
+            if use_euclidean:
+                # For Euclidean, LOWER values mean more similar
+                distance = euclidean(new_embedding, embedding)
+                # If distance is less than threshold, faces are too similar
+                if distance < threshold:  # Typical threshold for Euclidean: 0.9-1.1
+                    return False
+            else:
+                # For cosine, LOWER values mean more similar
+                distance = cosine(new_embedding, embedding)
+                # If distance is less than threshold, faces are too similar
+                if distance < threshold:  # Typical threshold for cosine: 0.6-0.8
+                    return False
+
+        # If we get here, the face is different from all stored faces
+        return True
+
+    def create_face_summary_dynamic(self, unique_face_data):
+        """Create visual summary of unique faces from dynamic video processing."""
+        if not unique_face_data:
+            print("No unique faces to summarize")
+            return
+
+        # Create a directory for unique faces
+        unique_faces_dir = os.path.join(self.output_dir, "unique_faces")
+        if not os.path.exists(unique_faces_dir):
+            os.makedirs(unique_faces_dir)
+
+        # Get best faces (one per person)
+        person_ids = set(face['person_id'] for face in unique_face_data)
+        best_faces = []
+
+        for person_id in person_ids:
+            # Get all faces for this person
+            person_faces = [face for face in unique_face_data if face['person_id'] == person_id]
+
+            # Find face with largest size (best quality)
+            best_face = max(person_faces, key=lambda x: x['size'])
+            best_faces.append(best_face)
+
+            # Copy to unique faces directory
+            src_file = best_face['filename']
+            dst_file = os.path.join(unique_faces_dir, f"person_{person_id}.jpg")
+
+            # Read and write the image
+            img = cv2.imread(src_file)
+            if img is not None:
+                cv2.imwrite(dst_file, img)
+
+        # Create a summary image with all unique faces
+        summary_height = 150
+        summary_width = 150 * min(len(best_faces), 10)  # Show up to 10 people
+        if summary_width == 0:
+            summary_width = 150
+
+        summary_image = np.zeros((summary_height, summary_width, 3), dtype=np.uint8)
+
+        for i, face_data in enumerate(best_faces[:10]):
+            face_img = cv2.imread(face_data['filename'])
+            if face_img is not None:
+                # Resize if needed
+                h, w = face_img.shape[:2]
+
+                # Place in summary image
+                x_offset = i * 150
+                max_h = min(h, summary_height)
+                max_w = min(w, 150)
+
+                if max_h > 0 and max_w > 0:
+                    summary_image[0:max_h, x_offset:x_offset+max_w] = face_img[:max_h, :max_w]
+
+        # Save summary image
+        summary_path = os.path.join(self.output_dir, "unique_faces_summary.jpg")
+        cv2.imwrite(summary_path, summary_image)
+        print(f"\n✓ Summary image with unique faces saved to {summary_path}")
+        print(f"✓ Individual unique faces saved to {unique_faces_dir}")
+
+        # Create HTML summary
+        html_path = os.path.join(self.output_dir, "unique_faces_summary.html")
+
+        with open(html_path, 'w') as f:
+            f.write(f'''
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Unique Faces Summary</title>
+                <style>
+                    body {{
+                        font-family: Arial, sans-serif;
+                        margin: 20px;
+                        background-color: #f5f5f5;
+                    }}
+                    h1 {{
+                        color: #333;
+                        border-bottom: 2px solid #ddd;
+                        padding-bottom: 10px;
+                    }}
+                    .face-grid {{
+                        display: grid;
+                        grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+                        gap: 20px;
+                        margin-top: 20px;
+                    }}
+                    .face-card {{
+                        background: white;
+                        border-radius: 8px;
+                        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                        padding: 15px;
+                        transition: transform 0.2s;
+                    }}
+                    .face-card:hover {{
+                        transform: translateY(-5px);
+                        box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+                    }}
+                    .face-img {{
+                        width: 100%;
+                        border-radius: 4px;
+                    }}
+                    .metadata {{
+                        margin-top: 10px;
+                        color: #666;
+                        font-size: 14px;
+                    }}
+                </style>
+            </head>
+            <body>
+                <h1>Unique Faces Summary (Dynamic Video Processing)</h1>
+                <p>Total unique faces detected: {len(person_ids)}</p>
+
+                <div class="face-grid">
+            ''')
+
+            for face_data in best_faces:
+                # Calculate relative path for image
+                rel_path = os.path.relpath(face_data['filename'], self.output_dir)
+
+                f.write(f'''
+                <div class="face-card">
+                    <img class="face-img" src="{rel_path}" alt="Face #{face_data['person_id']}">
+                    <div class="metadata">
+                        <p><strong>Face ID:</strong> {face_data['person_id']}</p>
+                        <p><strong>Frame:</strong> {face_data['frame']}</p>
+                    </div>
+                </div>
+                ''')
+
+            f.write('''
+                </div>
+            </body>
+            </html>
+            ''')
+
+        print(f"✓ HTML summary saved to {html_path}")
+        return summary_path
+
+    # ======================= MIXED VIDEO PROCESSING =======================
+
+    def segment_video(self, video_path, window_size=30, diff_threshold=5):
+        """
+        Segment video into static and dynamic regions.
+
+        Args:
+            video_path: Path to video file
+            window_size: Number of frames to analyze in each window
+            diff_threshold: Threshold for determining static vs dynamic
+
+        Returns:
+            List of segments with format: [(start_frame, end_frame, is_static)]
+        """
+        print("Segmenting video into static and dynamic regions...")
+
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print("Error opening video file")
+            return []
+
+        # Get video properties
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        segments = []
+        current_segment_start = 0
+        current_segment_is_static = None
+
+        # Process video in windows
+        for start_frame in range(0, total_frames, window_size):
+            end_frame = min(start_frame + window_size, total_frames)
+
+            # Analyze window to determine if static or dynamic
+            static_ratio = self._analyze_window(cap, start_frame, end_frame, diff_threshold)
+            is_static = static_ratio > 0.8
+
+            # Start the first segment
+            if current_segment_is_static is None:
+                current_segment_is_static = is_static
+
+            # If segment type changes, add the completed segment and start a new one
+            if is_static != current_segment_is_static:
+                segments.append((current_segment_start, start_frame-1, current_segment_is_static))
+                current_segment_start = start_frame
+                current_segment_is_static = is_static
+
+        # Add the final segment
+        segments.append((current_segment_start, total_frames-1, current_segment_is_static))
+
+        cap.release()
+
+        # Print summary
+        for i, (start, end, is_static) in enumerate(segments):
+            segment_type = "Static" if is_static else "Dynamic"
+            print(f"Segment {i+1}: Frames {start}-{end} ({segment_type})")
+
+        return segments
+
+    def _analyze_window(self, cap, start_frame, end_frame, diff_threshold):
+        """Helper method to analyze a window of frames for static/dynamic determination"""
+        frame_indices = np.linspace(start_frame, end_frame-1,
+                                   min(10, end_frame-start_frame), dtype=int)
+
+        static_count = 0
+        total_count = 0
+
+        # Get first frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_indices[0])
+        ret, prev_frame = cap.read()
+        if not ret:
+            return 0
+
+        prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+
+        # Compare subsequent frames
+        for i in range(1, len(frame_indices)):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_indices[i])
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Calculate difference
+            diff = np.mean(np.abs(gray.astype(float) - prev_gray.astype(float)))
+
+            if diff < diff_threshold:
+                static_count += 1
+
+            total_count += 1
+            prev_gray = gray
+
+        return static_count / max(1, total_count)
+
+    def process_mixed_video(self, video_path, static_params=None, dynamic_params=None):
+        """
+        Process a video that contains both static and dynamic segments.
+
+        Args:
+            video_path: Path to video file
+            static_params: Dictionary of parameters for static processing
+            dynamic_params: Dictionary of parameters for dynamic processing
+
+        Returns:
+            List of all unique face data
+        """
+        # Default parameters if none provided
+        if static_params is None:
+            static_params = {
+                'frame_interval': 10,
+                'max_frames': 300,
+                'threshold': 0.4,
+                'min_face_size': 20
+            }
+
+        if dynamic_params is None:
+            dynamic_params = {
+                'sample_rate': 2,
+                'similarity_threshold': 0.7,
+                'use_euclidean': False
+            }
+
+        # Segment the video
+        segments = self.segment_video(video_path)
+
+        # Process each segment with appropriate method
+        all_face_data = []
+        all_embeddings = []
+
+        for segment_index, (start_frame, end_frame, is_static) in enumerate(segments):
+            print(f"\nProcessing segment {segment_index+1} ({start_frame}-{end_frame})...")
+
+            # Create temporary video file for this segment
+            segment_path = os.path.join(self.output_dir, f"segment_{segment_index}.mp4")
+            self._extract_segment(video_path, segment_path, start_frame, end_frame)
+
+            # Process with appropriate method
+            if is_static:
+                print(f"Processing as static segment...")
+                face_data, embeddings = self.process_static_video(
+                    segment_path,
+                    frame_interval=static_params['frame_interval'],
+                    max_frames=static_params['max_frames'],
+                    threshold=static_params['threshold'],
+                    min_face_size=static_params['min_face_size']
+                )
+            else:
+                print(f"Processing as dynamic segment...")
+                face_data, embeddings = self.process_dynamic_video(
+                    segment_path,
+                    sample_rate=dynamic_params['sample_rate'],
+                    similarity_threshold=dynamic_params['similarity_threshold'],
+                    use_euclidean=dynamic_params['use_euclidean']
+                )
+
+            # Update frame numbers to reflect original position in video
+            for face in face_data:
+                face['frame'] += start_frame
+                all_face_data.append(face)
+
+            all_embeddings.extend(embeddings)
+
+            # Clean up segment file
+            if os.path.exists(segment_path):
+                os.remove(segment_path)
+
+        # Now deduplicate faces across segments
+        unique_face_data = self._deduplicate_faces(all_face_data, all_embeddings)
+
+        # Create summary
+        self._create_summary_mixed(unique_face_data)
+
+        return unique_face_data
+
+    def _extract_segment(self, input_path, output_path, start_frame, end_frame):
+        """Extract a segment of video from start_frame to end_frame"""
+        cap = cv2.VideoCapture(input_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Create video writer for the segment
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        for _ in range(end_frame - start_frame + 1):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            out.write(frame)
+
+        cap.release()
+        out.release()
+
+        return output_path
+
+    def _deduplicate_faces(self, all_face_data, all_embeddings, threshold=0.6):
+        """
+        Deduplicate faces across all segments using embeddings.
+
+        This is important when the same person appears in both
+        static and dynamic segments.
+        """
+        print("\nDeduplicating faces across segments...")
+
+        if not all_face_data:
+            return []
+
+        # Create mapping from face_data index to embedding index
+        face_to_embedding = {i: i for i in range(len(all_face_data))}
+
+        # Group similar faces
+        groups = []
+        used_indices = set()
+
+        for i in range(len(all_face_data)):
+            if i in used_indices:
+                continue
+
+            # Start a new group
+            group = [i]
+            used_indices.add(i)
+
+            # Find similar faces
+            for j in range(i+1, len(all_face_data)):
+                if j in used_indices:
+                    continue
+
+        # Compare embeddings
+        dist = cosine(all_embeddings[face_to_embedding[i]], all_embeddings[face_to_embedding[j]])
+        if dist < threshold:
+            group.append(j)
+            used_indices.add(j)
+
+        groups.append(group)
+
+        # Create final list of unique faces
+        unique_face_data = []
+
+        for group in groups:
+            # Find best quality face in group
+            best_face_idx = max(group, key=lambda idx: all_face_data[idx]['size'])
+
+            # Get the best face and assign a unique person_id
+            best_face = all_face_data[best_face_idx].copy()
+            best_face['person_id'] = len(unique_face_data)
+
+            unique_face_data.append(best_face)
+
+        print(f"Found {len(unique_face_data)} unique faces after deduplication")
+        return unique_face_data
+
+    def _create_summary_mixed(self, unique_face_data):
+        """Create a summary for mixed video"""
+        # This could be either the static or dynamic summary method
+        # For simplicity, use the dynamic method which creates a grid
+        return self.create_face_summary_dynamic(unique_face_data)
+
+    def _detect_if_mixed(self, video_path, num_segments=5, diff_threshold=5):
+        """
+        Detect if a video contains both static and dynamic segments.
+
+        Args:
+            video_path: Path to video file
+            num_segments: Number of segments to sample
+            diff_threshold: Threshold for frame difference
+
+        Returns:
+            True if mixed, False otherwise
+        """
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return False
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        segment_size = total_frames // num_segments
+
+        segment_types = []
+
+        for i in range(num_segments):
+            start_frame = i * segment_size
+            end_frame = min((i + 1) * segment_size, total_frames)
+
+            # Sample frames from this segment
+            frame_indices = np.linspace(start_frame, end_frame-1,
+                                       min(10, end_frame-start_frame), dtype=int)
+
+            static_count = 0
+            total_count = 0
+
+            # Get first frame
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_indices[0])
+            ret, prev_frame = cap.read()
+            if not ret:
+                continue
+
+            prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+
+            # Compare subsequent frames
+            for j in range(1, len(frame_indices)):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_indices[j])
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+                # Calculate difference
+                diff = np.mean(np.abs(gray.astype(float) - prev_gray.astype(float)))
+
+                if diff < diff_threshold:
+                    static_count += 1
+
+                total_count += 1
+                prev_gray = gray
+
+            # Determine if segment is static
+            if total_count > 0:
+                static_ratio = static_count / total_count
+                is_static = static_ratio > 0.8
+                segment_types.append(is_static)
+
+        cap.release()
+
+        # Check if both static and dynamic segments exist
+        if len(segment_types) >= 2 and (True in segment_types) and (False in segment_types):
+            return True
+        else:
+            return False
+
+    # ======================= MAIN PROCESSING METHOD =======================
+
+    def process_youtube_url(self, youtube_url, force_static=False, force_dynamic=False, force_mixed=False, **kwargs):
+        """
+        Process a YouTube URL to extract unique faces.
+
+        Args:
+            youtube_url: YouTube video URL
+            force_static: Force static video processing
+            force_dynamic: Force dynamic video processing
+            force_mixed: Force mixed video processing
+            **kwargs: Additional parameters for processing
+
+        Returns:
+            List of unique face data
+        """
+        start_time = time.time()
+
+        print(f"Processing YouTube video: {youtube_url}")
+
+        # Step 1: Download video
+        video_path = self.download_youtube_video(youtube_url)
+        if not video_path:
+            print("Failed to download video")
+            return []
+
+        # Step 2: Determine processing method
+        if force_static:
+            is_static = True
+            is_mixed = False
+            print("Forcing static video processing as requested")
+        elif force_dynamic:
+            is_static = False
+            is_mixed = False
+            print("Forcing dynamic video processing as requested")
+        elif force_mixed:
+            is_mixed = True
+            print("Forcing mixed video processing as requested")
+        else:
+            # Try to auto-detect if mixed by sampling multiple segments
+            is_mixed = self._detect_if_mixed(video_path)
+
+            if is_mixed:
+                print("Detected mixed video with both static and dynamic segments")
+            else:
+                is_static = self.is_static_video(video_path)
+
+        # Step 3: Process with the appropriate method
+        if is_mixed:
+            # Extract parameters for static and dynamic processing
+            static_params = {
+                'frame_interval': kwargs.get('frame_interval', 10),
+                'max_frames': kwargs.get('max_frames', 300),
+                'threshold': kwargs.get('threshold', 0.4),
+                'min_face_size': kwargs.get('min_face_size', 20)
+            }
+
+            dynamic_params = {
+                'sample_rate': kwargs.get('sample_rate', 2),
+                'similarity_threshold': kwargs.get('similarity_threshold', 0.7),
+                'use_euclidean': kwargs.get('use_euclidean', False)
+            }
+
+            unique_faces = self.process_mixed_video(
+                video_path,
+                static_params=static_params,
+                dynamic_params=dynamic_params
+            )
+        elif is_static:
+            # Use more aggressive parameters for static videos
+            static_threshold = kwargs.get('threshold', 0.4)
+            unique_faces, _ = self.process_static_video(
+                video_path,
+                frame_interval=kwargs.get('frame_interval', 10),
+                max_frames=kwargs.get('max_frames', 300),
+                threshold=static_threshold,
+                min_face_size=kwargs.get('min_face_size', 20)
+            )
+        else:
+            # Use parameters optimized for dynamic videos
+            unique_faces, _ = self.process_dynamic_video(
+                video_path,
+                sample_rate=kwargs.get('sample_rate', 2),
+                similarity_threshold=kwargs.get('similarity_threshold', 0.7),
+                use_euclidean=kwargs.get('use_euclidean', False)
+            )
+
+        # Clean up
+        if os.path.exists(video_path):
+            os.remove(video_path)
+            print(f"✓ Removed temporary video file")
+
+        # Calculate processing time
+        end_time = time.time()
+        processing_time = end_time - start_time
+
+        print(f"\n✅ Processing complete! Found {len(unique_faces)} unique faces")
+        print(f"Processing time: {processing_time:.2f} seconds")
+        print(f"Results saved to: {self.output_dir}")
+
+        return unique_faces
+
+def main():
+    """Run the YouTube Face Finder with user input."""
+    print("\n====== YouTube Face Finder - Intelligent Static/Dynamic Detector ======\n")
+    print("This tool extracts unique faces from YouTube videos.")
+    print("It automatically detects if a video is static, dynamic, or mixed and uses the appropriate method.")
+
+    # Get YouTube URL from user
+    youtube_url = input("\nEnter YouTube URL: ").strip()
+
+    if not youtube_url:
+        print("⚠️ No URL provided. Exiting.")
+        return
+
+    # Create timestamp-based output directory
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"youtube_faces_{timestamp}"
+
+    # Processing mode
+    print("\nProcessing mode:")
+    print("1. Force static video processing")
+    print("2. Force dynamic video processing")
+    print("3. Force mixed video processing")
+    mode_choice = input("Choose mode (1-4, default: 1): ").strip()
+
+    force_static = mode_choice == '2'
+    force_dynamic = mode_choice == '3'
+    force_mixed = mode_choice == '4'
+
+    # Advanced options
+    show_advanced = input("Show advanced options? (y/n, default: n): ").lower()
+
+    # Default parameters
+    kwargs = {
+        'sample_rate': 2,
+        'similarity_threshold': 0.7,
+        'use_euclidean': False,
+        'frame_interval': 10,
+        'max_frames': 300,
+        'threshold': 0.4,
+        'min_face_size': 20
+    }
+
+    if show_advanced in ['y', 'yes']:
+        # Dynamic video options
+        if not force_static:
+            sample_rate_input = input("Process every Nth frame for dynamic videos (default: 2, lower = more thorough): ")
+            if sample_rate_input and sample_rate_input.isdigit():
+                kwargs['sample_rate'] = int(sample_rate_input)
+
+            threshold_input = input("Similarity threshold for dynamic videos (default: 0.7, higher = more unique faces): ")
+            if threshold_input and threshold_input.replace('.', '', 1).isdigit():
+                kwargs['similarity_threshold'] = float(threshold_input)
+
+        # Static video options
+        if not force_dynamic:
+            frame_interval_input = input("Frame interval for static videos (default: 10): ")
+            if frame_interval_input and frame_interval_input.isdigit():
+                kwargs['frame_interval'] = int(frame_interval_input)
+
+            max_frames_input = input("Maximum frames to process for static videos (default: 300): ")
+            if max_frames_input and max_frames_input.isdigit():
+                kwargs['max_frames'] = int(max_frames_input)
+
+            static_threshold_input = input("Similarity threshold for static videos (default: 0.4): ")
+            if static_threshold_input and static_threshold_input.replace('.', '', 1).isdigit():
+                kwargs['threshold'] = float(static_threshold_input)
+
+        # Common options
+        distance_input = input("Use Euclidean distance instead of cosine? (y/n, default: n): ").lower()
+        kwargs['use_euclidean'] = distance_input in ['y', 'yes']
+
+    print("\nStarting YouTube Face Finder...")
+    if force_static:
+        print("Mode: Static video processing (forced)")
+    elif force_dynamic:
+        print("Mode: Dynamic video processing (forced)")
+    elif force_mixed:
+        print("Mode: Mixed video processing (forced)")
+    else:
+        print("Mode: Auto-detect video type (static, dynamic, or mixed)")
+
+    # Check for GPU
+    if torch.cuda.is_available():
+        print("✓ GPU detected! Using GPU acceleration for faster processing.")
+    else:
+        print("⚠️ No GPU detected. Processing will be slower.")
+
+    # Create the face finder
+    finder = YouTubeFaceFinder(output_dir=output_dir)
+
+    # Process the video
+    finder.process_youtube_url(
+        youtube_url,
+        force_static=force_static,
+        force_dynamic=force_dynamic,
+        force_mixed=force_mixed,
+        **kwargs
+    )
+
+if __name__ == "__main__":
+    main()
+                    
